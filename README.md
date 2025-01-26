@@ -9,7 +9,6 @@
 * Install from source (Recommend)
 
 ```bash
-cd MiniRAG
+cd mem1
 pip install -e .
 ```
-
