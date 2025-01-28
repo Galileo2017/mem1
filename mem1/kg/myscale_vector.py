@@ -1,10 +1,9 @@
 import asyncio
-import os
 from tqdm.asyncio import tqdm as tqdm_async
 import numpy as np
 from dataclasses import dataclass
 from typing import Union,Any
-from clickhouse_connect import get_client,Client
+from clickhouse_connect import get_client
 
 from ..utils import logger
 from ..base import (
