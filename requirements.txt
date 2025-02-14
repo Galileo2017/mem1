@@ -41,3 +41,4 @@ pymilvus
 clickhouse-connect 
 nebula3-python
 aioredis
+clickhouse-driver

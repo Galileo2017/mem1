@@ -1,149 +1,198 @@
 import asyncio
-from tqdm.asyncio import tqdm as tqdm_async
-import numpy as np
+import json
 from dataclasses import dataclass
-from typing import Union,Any
-from clickhouse_connect import get_client
+from typing import Dict, List, Union
+import numpy as np
+from tqdm.asyncio import tqdm as tqdm_async
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+from clickhouse_driver import Client as ClickHouseClient
+from clickhouse_driver.errors import NetworkError, SocketTimeoutError
 
 from ..utils import logger
 from ..base import (
     BaseVectorStorage,
 )
-from enum import Enum
-class SortOrder(Enum):
-    ASC = "ASC"
-    DESC = "DESC"
-class MyScaleConf:
+
+@dataclass
+class MyScaleVectorStorageConfig:
     host: str
     port: int
-    user: str
+    username: str
     password: str
-    database: str
-    fts_params: str
+    database: str = "default"
+    vector_dim: int = 768         # 向量维度
+    index_type: str = "IVFSQ"       # 索引类型
+    metric_type: str = "Cosine"   # 距离度量类型
+    max_connections: int = 10     # 最大连接数
 
 @dataclass
 class MyScaleVectorStorage(BaseVectorStorage):
     cosine_better_than_threshold: float = 0.2
-
-    @staticmethod
-    def create_collection_if_not_exist(
-        client: any,conf:MyScaleConf, collection_name: str, dimension: int
-    ):
-        metric: str = "Cosine"
-        client.command(f"CREATE DATABASE IF NOT EXISTS {conf.database}")
-        fts_params = f"('{conf.fts_params}')" if conf.fts_params else ""
-        sql = f"""
-            CREATE TABLE IF NOT EXISTS {conf.database}.{collection_name}(
-                id String,
-                text String,
-                vector Array(Float32),
-                metadata JSON,
-                CONSTRAINT cons_vec_len CHECK length(vector) = {dimension},
-                VECTOR INDEX vidx vector TYPE DEFAULT('metric_type = {metric}'),
-                INDEX text_idx text TYPE fts{fts_params}
-            ) ENGINE = MergeTree ORDER BY id
-        """
-        client.command(sql)
-
+    config: MyScaleVectorStorageConfig=None
+    client: ClickHouseClient = None
+    
     def __post_init__(self):
-        conf=MyScaleConf(
-            host=self.global_config["myscale_host"],
-            port=self.global_config["myscale_port"],
-            user=self.global_config["myscale_user"],
-            password=self.global_config["myscale_password"],
-            database=self.global_config["myscale_database"],
-            fts_params=self.global_config["myscale_fts_params"])
-        self._conf=conf
-        self._client = get_client(
-            host=conf.host, 
-            port=conf.port, 
-            username=conf.user, 
-            password=conf.password, 
-            database=conf.database)
-        self._client.command("SET allow_experimental_object_type=1")
-        MyScaleVectorStorage.create_collection_if_not_exist(
-            self._client,
-            self._conf,
-            self.namespace,
-            dimension=self.embedding_func.embedding_dim,
+        self._init_client()
+        self._verify_table_structure()
+
+    def _init_client(self):
+        """初始化MyScale连接"""
+        self.client = ClickHouseClient(
+            host=self.config.host,
+            port=self.config.port,
+            user=self.config.username,
+            password=self.config.password,
+            database=self.config.database,
+            settings={'use_numpy': True}  # 启用numpy支持
         )
-       
+        
+    def _verify_table_structure(self):
+        """验证并创建表结构"""
+        create_table_sql = f"""
+        CREATE TABLE IF NOT EXISTS {self.namespace} (
+            id String,
+            content String,
+            vector Array(Float32),
+            metadata Map(String, String),
+            created_at DateTime DEFAULT now()
+        ) ENGINE = MergeTree()
+        ORDER BY id;
+        """
+        self.client.execute(create_table_sql)
+        #创建索引
+        create_index_sql = f"ALTER TABLE {self.namespace} ADD VECTOR INDEX vec_idx vector TYPE {self.config.index_type}('metric_type={self.config.metric_type}');"
+        self.client.execute(create_index_sql)
 
-    async def upsert(self, data: dict[str, dict]):
-        """向向量数据库中插入数据"""
-        logger.info(f"Inserting {len(data)} vectors to {self.namespace}")
-        if not len(data):
-            logger.warning("You insert an empty data to vector DB")
-            return []
-        list_data = [
-            {
-                "id": k,
-                **{k1: v1 for k1, v1 in v.items() if k1 in self.meta_fields},
-            }
-            for k, v in data.items()
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((NetworkError, SocketTimeoutError))
+    )
+    async def upsert(self, data: Dict[str, dict]):
+        """批量插入/更新向量数据"""
+        if not data:
+            return
+
+        # 生成批量插入数据
+        vectors = []
+        contents = []
+        ids = []
+        metadata = []
+        
+        # 批量生成嵌入
+        content_batches = [
+            list(data.values())[i:i+self._max_batch_size] 
+            for i in range(0, len(data), self._max_batch_size)
         ]
-        contents = [v["content"] for v in data.values()]
-        batches = [
-            contents[i : i + self._max_batch_size]
-            for i in range(0, len(contents), self._max_batch_size)
-        ]
+        
+        for batch in tqdm_async(content_batches, desc="Generating embeddings"):
+            embeddings = await self.embedding_func(
+                [item["content"] for item in batch]
+            )
+            for item, vector in zip(batch, embeddings):
+                ids.append(item["id"])
+                contents.append(item["content"])
+                vectors.append(vector.tolist())
+                metadata.append(json.dumps(item.get("metadata", {})))
 
-        async def wrapped_task(batch):
-            result = await self.embedding_func(batch)
-            pbar.update(1)
-            return result
-
-        embedding_tasks = [wrapped_task(batch) for batch in batches]
-        pbar = tqdm_async(
-            total=len(embedding_tasks), desc="Generating embeddings", unit="batch"
+        # 使用ClickHouse的批量插入
+        insert_sql = f"""
+        INSERT INTO {self.namespace} (
+            id, content, vector, metadata
+        ) VALUES"""
+        
+        self.client.execute(
+            insert_sql,
+            [{
+                "id": _id,
+                "content": content,
+                "vector": vector,
+                "metadata": meta
+            } for _id, content, vector, meta in zip(ids, contents, vectors, metadata)],
+            types_check=True
         )
-        embeddings_list = await asyncio.gather(*embedding_tasks)
 
-        embeddings = np.concatenate(embeddings_list)
-        for i, d in enumerate(list_data):
-            d["vector"] = embeddings[i]
-        results = self._client.upsert(collection_name=self.namespace, data=list_data)
-        return results
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=5),
+        retry=retry_if_exception_type((NetworkError, SocketTimeoutError))
+    )
+    async def query(self, query: str, top_k: int = 5) -> List[Dict]:
+        """向量相似性搜索"""
+        # 生成查询向量
+        query_embedding = (await self.embedding_func([query]))[0].tolist()
+        
+        search_sql = f"""
+        SELECT 
+            id,
+            content,
+            metadata,
+            distance(vector, {query_embedding}) AS score
+        FROM {self.namespace}
+        ORDER BY score DESC
+        LIMIT {top_k}
+        """
+        
+        result = self.client.execute(search_sql)
+        return [{
+            "id": row[0],
+            "content": row[1],
+            "metadata": json.loads(row[2]),
+            "score": row[3]
+        } for row in result]
 
     async def index_done_callback(self):
-        pass
-
-    def _search(self,collection_name:str, dist: str, order: SortOrder, **kwargs: Any) -> list[dict]:
-        top_k = kwargs.get("top_k", 4)
-        score_threshold = float(kwargs.get("score_threshold") or 0.0)
-        where_str = (
-            f"WHERE dist < {1 - score_threshold}"
-            if self._metric.upper() == "COSINE" and order == SortOrder.ASC and score_threshold > 0.0
-            else ""
-        )
-        sql = f"""
-            SELECT text, vector, metadata, {dist} as dist FROM {self._conf.database}.{collection_name}
-            {where_str} ORDER BY dist {order.value} LIMIT {top_k}
+        """索引构建完成后的优化操作"""
+        optimize_sql = f"""
+        OPTIMIZE TABLE {self.namespace} 
+        FINAL
         """
-        try:
-            return [
-                {
-                    'page_content':r["text"],
-                    'vector':r["vector"],
-                    'metadata':r["metadata"],
-                }
-                for r in self._client.query(sql).named_results()
-            ]
-        except Exception as e:
-            logger.error(f"\033[91m\033[1m{type(e)}\033[0m \033[95m{str(e)}\033[0m")  # noqa:TRY401
-            return []
+        self.client.execute(optimize_sql)
+        logger.info(f"Optimized MyScale table {self.namespace}")
 
-    async def query(self, query: str, top_k=5) -> Union[dict, list[dict]]:
-        embedding = await self.embedding_func([query])
-        results = self._search(
-            collection_name=self.namespace,
-            data=embedding,
-            limit=top_k,
-            output_fields=list(self.meta_fields),
-            search_params={"metric_type": "COSINE", "params": {"radius": 0.2}},
-        )
-        return [
-            {**dp["entity"], "id": dp["id"], "distance": dp["distance"]}
-            for dp in results[0]
-        ]
+    async def delete_by_ids(self, ids: List[str]):
+        """按ID批量删除"""
+        delete_sql = f"""
+        ALTER TABLE {self.namespace}
+        DELETE WHERE id IN (%(ids)s)
+        """
+        self.client.execute(delete_sql, {"ids": ids})
 
+# 使用示例
+if __name__ == "__main__":
+    config = MyScaleVectorStorageConfig(
+        host="192.168.195.29",
+        port=8126,
+        username="default",
+        database="test",
+        password="",
+        vector_dim=768,
+        index_type="IVF_PQ",
+        metric_type="Cosine"
+    )
+    
+    storage = MyScaleVectorStorage(
+        namespace="doc_vectors",
+        global_config={"embedding_batch_num": 64},
+        embedding_func=lambda x: np.random.rand(len(x), 768),  # 示例嵌入函数
+        config=config
+    )
+    
+    # 测试插入数据
+    test_data = {
+        f"doc_{i}": {
+            "id": f"doc_{i}",
+            "content": f"Document content {i}",
+            "metadata": {"source": "test"}
+        } for i in range(100)
+    }
+    asyncio.run(storage.upsert(test_data))
+    
+    # 测试查询
+    results = asyncio.run(storage.query("test query", top_k=3))
+    print("Top 3 results:", results)
